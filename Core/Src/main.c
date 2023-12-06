@@ -18,28 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "string.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-uint8_t Vector_tx[7]="hola";
-uint8_t Vector_rx[7];
-uint8_t Valor_parseo;
-uint8_t Vector_recepcion[130];
-uint8_t* Vector_recepcion_aux;
-uint8_t Direccion[3];
-uint8_t* Payload;
-uint32_t CRC_calc=0;
-int a=0;
-
-int i=0;
-
-struct Encabezado_msg {
-    uint8_t nodo_origen;
-    uint8_t nodo_destino;
-    uint8_t size;
-    uint8_t payload[125];			//de 0 a 124 bytes (125 en total).Una lástima por el CRC, se pondrá después
-}; //Falta pensar cómo incorporar el payload de tamaño variable, y luego el CRC de 4 bytes fijos.
+#include "stdbool.h"
+#include "string.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,6 +33,8 @@ struct Encabezado_msg {
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define ORIGEN 2
+#define PACKET_DROP -1
+#define CRC_FAIL 1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -65,6 +50,64 @@ UART_HandleTypeDef huart6;
 DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
+uint8_t Vector_tx[7]="hola";
+uint8_t Vector_rx[7];
+uint8_t Valor_parseo;
+uint8_t Vector_recepcion[130];
+uint8_t* Vector_recepcion_aux;
+uint8_t crc_rx[4];
+uint8_t* crc_ptr_rx=crc_rx;
+uint8_t	contador_recepcion;
+uint8_t Direccion[3];
+uint8_t* Payload;
+uint32_t CRC_calc=0;
+uint32_t tamanio_a_recibir=128;		//le damos el valor inicial máximo posible, y despues se ajusta al valor real cuando se sepa el size realmente.
+uint32_t contador_crc;
+bool paquete_listo=false;
+int a=0;
+
+int i=0;
+
+struct Encabezado_msg {
+    uint8_t nodo_origen;
+    uint8_t nodo_destino;
+    uint8_t size;
+    uint8_t payload[125];			//de 0 a 124 bytes (125 en total).Una lástima por el CRC, se pondrá después
+}; //Falta pensar cómo incorporar el payload de tamaño variable, y luego el CRC de 4 bytes fijos.
+//Defino todo acá así no hay problemas
+//Necesito declarar la estructura de la forma larga, para que me permita la inicializacion
+ struct Encabezado_msg Encabezado_tx = {
+	    .nodo_origen = 0,
+	    .nodo_destino = 0,
+	    .size = 0,
+	    .payload = {0}  // Esto inicializa todos los elementos del arreglo a cero
+ };
+
+ struct Encabezado_msg* Encabezado_ptr_tx=&Encabezado_tx;
+
+ struct Encabezado_msg Encabezado_tx_ack = {
+	    .nodo_origen = 0,
+	    .nodo_destino = 0,
+	    .size = 0,
+	    .payload = {0}  // Esto inicializa todos los elementos del arreglo a cero
+ };
+
+ struct Encabezado_msg* Encabezado_ptr_tx_ack=&Encabezado_tx_ack;
+
+ struct Encabezado_msg Encabezado_rx = {
+	    .nodo_origen = 0,
+	    .nodo_destino = 0,
+	    .size = 0,
+	    .payload = {0}  // Esto inicializa todos los elementos del arreglo a cero
+ };
+
+ struct Encabezado_msg* Encabezado_ptr_rx=&Encabezado_rx;
+
+CRC_HandleTypeDef hcrc;
+
+UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart6;
+DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE END PV */
 
@@ -77,6 +120,10 @@ static void MX_USART6_UART_Init(void);
 static void MX_CRC_Init(void);
 /* USER CODE BEGIN PFP */
 uint8_t convertir_ascii(uint8_t*vector_direccion);
+int8_t Receive_handler(void);
+void print(void);
+void send_ack(bool state);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -116,20 +163,21 @@ int main(void)
   MX_USART6_UART_Init();
   MX_CRC_Init();
   /* USER CODE BEGIN 2 */
-  //Necesito declarar la estructura de la forma larga, para que me permita la inicializacion
-  struct Encabezado_msg Encabezado = {
-	    .nodo_origen = 0,
-	    .nodo_destino = 0,
-	    .size = 0,
-	    .payload = {0}  // Esto inicializa todos los elementos del arreglo a cero
-  };
-
-  struct Encabezado_msg* Encabezado_ptr=&Encabezado;
-
-  //Vector_tx[4]='\n';
+   //Vector_tx[4]='\n';
   //Vector_tx[5]='\r';
   //HAL_UART_Transmit_DMA(&huart2, Vector_tx, sizeof(Vector_tx));
-  //Máquina de estados:
+
+  //Ponemos a escuchar uart6 y recibir por interrupción.
+  //Le paso a la API una copia del puntero al vector de recepcion real.
+  //En la callback de recepcion, hay que ponerlo a escuchar de nuevo 1 byte.
+  //Ojo que en algún lado hay que incrementar el puntero a la estructura.
+  HAL_UART_Receive_IT(&huart6, (uint8_t*)Encabezado_ptr_rx, 1);
+
+  //Máquina de estados de recepcion de afuera (rs485):
+
+
+
+  //Máquina de estados de recepcion para pc:
 
   enum states{ESPERANDO_1ER_ENTER, RECIBIENDO_CARACTERES,ENVIANDO_VECTOR};
 
@@ -145,8 +193,8 @@ int main(void)
 	switch (state){
 
 	case ESPERANDO_1ER_ENTER:
-
-		HAL_UART_Receive(&huart2, (uint8_t *)&Valor_parseo, 1 , HAL_MAX_DELAY);		//Aquí se chequea que lo ingresado no sea un enter
+		HAL_UART_Receive_DMA(&huart2, (uint8_t *)&Valor_parseo, 1);	//no bloqueante
+		//HAL_UART_Receive(&huart2, (uint8_t *)&Valor_parseo, 1 , HAL_MAX_DELAY);		//Aquí se chequea que lo ingresado no sea un enter
 		if(Valor_parseo==0xD)
 			{Valor_parseo=0;
 			Vector_recepcion[0]=0x0D;							//Le pongo el enter al principio de la recepción como pide el enunciado
@@ -156,23 +204,30 @@ int main(void)
 		break;
 
 	case RECIBIENDO_CARACTERES:
+		HAL_Delay(100);
+		HAL_UART_Receive_DMA(&huart2, (uint8_t *)&Valor_parseo, 1);
+		//HAL_UART_Receive(&huart2, (uint8_t *)&Valor_parseo, 1 , HAL_MAX_DELAY);		//Aquí se chequea que lo ingresado no sea un enter
+		if(Valor_parseo!=0)	//Puesto para poder hacer al sistema no bloqueante.
+		{
+			if(Valor_parseo==0xD)
+				{Valor_parseo=0;
+				*Vector_recepcion_aux=0x0D;			//Dejamos en el último valor del vector de recepcion, el valor 0x0D. Recordar que no hay que
+				//HAL_Delay(30);					//incrementar porque ya fue incrementado previamente.
+				state=ENVIANDO_VECTOR;
+				break;}
+			if(i<127)
+				{*Vector_recepcion_aux=Valor_parseo;		//Correccion para evitar doble tecleo de cada tecla
+				Vector_recepcion_aux++;
+				//HAL_UART_Receive(&huart2, Vector_recepcion_aux++,1, HAL_MAX_DELAY);	//Primero actua, despues incrementa en 1 así sigue cargando a Vector_recepcion
+				Valor_parseo=0;
+				i++;}														//de forma correcta. Falta limitar a 130 caracteres
+			else
+				{Vector_recepcion[127]=0x0D;							//Fijamos el último valor en 0x0D (sólo en el caso de llenar todo el vector)
+					Vector_recepcion_aux=Vector_recepcion;					//Volvemos a darle la dirección del vector original para la siguiente pasada
+					state=ENVIANDO_VECTOR;}	//Pasamos de estado de forma forzosa.
 
-		HAL_UART_Receive(&huart2, (uint8_t *)&Valor_parseo, 1 , HAL_MAX_DELAY);		//Aquí se chequea que lo ingresado no sea un enter
-		if(Valor_parseo==0xD)
-			{Valor_parseo=0;
-			*Vector_recepcion_aux=0x0D;			//Dejamos en el último valor del vector de recepcion, el valor 0x0D. Recordar que no hay que
-			//HAL_Delay(30);					//incrementar porque ya fue incrementado previamente.
-			state=ENVIANDO_VECTOR;
-			break;}
-		if(i<127)
-			{*Vector_recepcion_aux=Valor_parseo;		//Correccion para evitar doble tecleo de cada tecla
-			Vector_recepcion_aux++;
-			//HAL_UART_Receive(&huart2, Vector_recepcion_aux++,1, HAL_MAX_DELAY);	//Primero actua, despues incrementa en 1 así sigue cargando a Vector_recepcion
-			i++;}														//de forma correcta. Falta limitar a 130 caracteres
-		else
-			{Vector_recepcion[127]=0x0D;							//Fijamos el último valor en 0x0D (sólo en el caso de llenar todo el vector)
-			Vector_recepcion_aux=Vector_recepcion;					//Volvemos a darle la dirección del vector original para la siguiente pasada
-			state=ENVIANDO_VECTOR;}									//Pasamos de estado de forma forzosa.
+		}
+
 		break;
 
 	case ENVIANDO_VECTOR:
@@ -189,10 +244,10 @@ int main(void)
 		//Comienzo a armar la estructura del mensaje
 
 
-		Encabezado.nodo_origen=ORIGEN;
-		Encabezado.nodo_destino= convertir_ascii(Vector_recepcion);	//Se toman los bytes correctos de "Vector_recepcion" en la conversión
-		memcpy(Encabezado.payload, Payload, (i-3) );				//Le paso el puntero previamente creado. Luego movemos la cantidad de datos a transmitir. No se puede hacer de otra forma. Tiene Destino, Origen, size de bytes. Todo punteros.
-		Encabezado.size=(i-3);
+		Encabezado_tx.nodo_origen=ORIGEN;
+		Encabezado_tx.nodo_destino= convertir_ascii(Vector_recepcion);	//Se toman los bytes correctos de "Vector_recepcion" en la conversión
+		memcpy(Encabezado_tx.payload, Payload, (i-3) );				//Le paso el puntero previamente creado. Luego movemos la cantidad de datos a transmitir. No se puede hacer de otra forma. Tiene Destino, Origen, size de bytes. Todo punteros.
+		Encabezado_tx.size=(i-3);
 
 		//Antes de enviar, calculamos CRC
 		//Parece que esta función requiere que la cantidad de bytes a hacerle CRC sea divisible por 4 sí o sí.
@@ -201,12 +256,18 @@ int main(void)
 		//size = (i%4>0) ? ((i/4)+1) : (i/4);			//Chequea si el tamaño del vector total es divisible por 4 exacto, o si no lo es, hay que pasar i/4 +1, con ese resto de bytes extra rellenados con cero.
 		//Terminamos decidiendo en clase que hacemos CRC de todo, de los 125 bytes con todo relleno con cero.
 		HAL_CRC_Init(&hcrc);			//Para que estados pasados de CRC no afecten
-		CRC_calc=HAL_CRC_Calculate(&hcrc, (uint32_t*)Encabezado_ptr, (sizeof(Encabezado) / 4));
+		CRC_calc=HAL_CRC_Calculate(&hcrc, (uint32_t*)Encabezado_ptr_tx, (sizeof(Encabezado_tx) / 4));
 		//Procedo a transmitir uno tras otro
-		HAL_UART_Transmit(&huart6, (uint8_t*)Encabezado_ptr, i, HAL_MAX_DELAY);	//La UART de recepcion se hace sobre la 6!!
+		HAL_UART_Transmit(&huart6, (uint8_t*)Encabezado_ptr_tx, i, HAL_MAX_DELAY);	//La UART de recepcion se hace sobre la 6!!
 		HAL_UART_Transmit(&huart6, (uint8_t*) &CRC_calc, 4, HAL_MAX_DELAY);		//La de impresion por consola, por la 2 (la de la PC)
 		//Listorti la parte de envio
 		HAL_Delay(300);							//Delay porque si
+		//Limpio estructura
+		Encabezado_tx.nodo_origen=0;
+		Encabezado_tx.nodo_destino=0;
+		Encabezado_tx.size=0;
+		memset(Encabezado_tx.payload, 0, 125);
+		CRC_calc=0;
 		state=RECIBIENDO_CARACTERES;			//Ojo que alguna variable quiza quedo en un estado raro y haya que volverlo a su inicial.
 
 		//En algún momento de este estado se manda el vector via RS485, y se pasa al estado 1 de nuevo (con un delay si se quiere)
@@ -217,6 +278,8 @@ int main(void)
 		//Aunque se puede hacer con DMA y queda bonito, nunca se puede saber por interrupción cuando se termino de llenar el vector
 		//Me parece mejor hacerlo por interrupción y parsear en la callback.
 	}
+
+	Receive_handler();
   }
   /* USER CODE END 2 */
 
@@ -433,6 +496,137 @@ uint8_t convertir_ascii(uint8_t* vector_direccion)
 	destino=(vector_direccion[1]-48)*100 + (vector_direccion[2]-48)*10 + (vector_direccion[3]-48);
 	return destino;
 }
+
+int8_t Receive_handler(void)
+{
+	if(paquete_listo==true)
+	{
+		if(Encabezado_ptr_rx->nodo_destino==ORIGEN)
+		{
+			HAL_CRC_Init(&hcrc);
+			if(HAL_CRC_Calculate(&hcrc, (uint32_t*)Encabezado_ptr_rx, (sizeof(Encabezado_rx) / 4))==*(uint32_t*)crc_rx) //ver esto. El micro es little endian, es posible que el CRC recibido se reciba al reves.
+			{
+				print();
+				send_ack(true);
+			}
+			else
+			{
+				send_ack(false);
+				//Limpio estructura
+				Encabezado_rx.nodo_origen=0;
+				Encabezado_rx.nodo_destino=0;
+				Encabezado_rx.size=0;
+				memset(Encabezado_rx.payload, 0, 125);
+				CRC_calc=0;
+				return (CRC_FAIL);
+			}
+		}
+		else
+		{
+		Encabezado_rx.nodo_origen=0;
+		Encabezado_rx.nodo_destino=0;
+		Encabezado_rx.size=0;
+		memset(Encabezado_rx.payload, 0, 125);
+		CRC_calc=0;
+		return (PACKET_DROP);
+		}
+	}
+	else
+	return 0;
+
+	return 0;		//para prevenir warning del compilador
+}
+void print(void)
+{
+	HAL_UART_Transmit(&huart2, (uint8_t*)&(Encabezado_ptr_rx->payload),Encabezado_ptr_rx->size , HAL_MAX_DELAY);
+}
+void send_ack(bool state)
+{
+
+	Encabezado_tx_ack.nodo_origen=ORIGEN;
+	Encabezado_tx_ack.nodo_destino= Encabezado_ptr_rx->nodo_origen;	//Devuelvo ACK al origen del msg original
+	Encabezado_tx_ack.size=(state==true)? (2) : (5);				//=size = (i%4>0) ? ((i/4)+1) : (i/4);
+	if(state==true)
+	memcpy(Encabezado_tx_ack.payload, (unsigned char*)"OK", 2 );	//memcpy requiere punteros en sus argumentos. No se puede hacer de otra forma. Tiene Destino, Origen, size de bytes. Todo punteros.
+	else
+	memcpy(Encabezado_tx_ack.payload, (unsigned char*)"NO_OK", 5 );
+
+	HAL_CRC_Init(&hcrc);			//Para que estados pasados de CRC no afecten
+	CRC_calc=HAL_CRC_Calculate(&hcrc, (uint32_t*)Encabezado_ptr_tx_ack, (sizeof(Encabezado_tx_ack) / 4));
+	//Procedo a transmitir uno tras otro
+	if(state)
+	HAL_UART_Transmit(&huart6, (uint8_t*)Encabezado_ptr_tx_ack,5, HAL_MAX_DELAY);	//La UART de recepcion se hace sobre la 6!!
+	else
+	HAL_UART_Transmit(&huart6, (uint8_t*)Encabezado_ptr_tx_ack,8, HAL_MAX_DELAY);
+
+	HAL_UART_Transmit(&huart6, (uint8_t*) &CRC_calc, 4, HAL_MAX_DELAY);		//La de impresion por consola, por la 2 (la de la PC)
+
+	//Limpiamos las estructuras antes de irnos
+	Encabezado_tx_ack.nodo_origen=0;
+	Encabezado_tx_ack.nodo_destino=0;
+	Encabezado_tx_ack.size=0;
+	memset(Encabezado_tx_ack.payload, 0, 125);
+	CRC_calc=0;
+}
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+	enum states_rs485{RECIBIENDO_PAYLOAD, RECIBIENDO_CRC};
+
+	static enum states_rs485 state_rs485=RECIBIENDO_PAYLOAD;	//Solo se ejecuta esta linea la 1ra vez
+
+
+	if(huart->Instance==(USART_TypeDef*)&huart6)
+	{	//hacer acciones de recepcion
+
+		switch(state_rs485)
+		{
+		case RECIBIENDO_PAYLOAD:
+
+					contador_recepcion++;
+					if((Encabezado_ptr_rx->size)!=0 && contador_recepcion>=3)
+								tamanio_a_recibir=(Encabezado_ptr_rx->size)+3;	//tamanio a recibir tiene que arrancar en 128, despues se ajusta.
+
+					if(contador_recepcion<tamanio_a_recibir)
+					{
+						(uint8_t*)Encabezado_ptr_rx++;	//Comienzo incrementando el puntero si hay data valida.
+						HAL_UART_Receive_IT(&huart6, (uint8_t*)Encabezado_ptr_rx, 1);//vuelvo a poner a escuchar
+					}
+					else
+					{	//acá podemos pasar de estado a recibir CRC
+						contador_recepcion=0;
+						tamanio_a_recibir=128;			//Lo llevamos al valor máximo nuevamente
+						Encabezado_ptr_rx=&Encabezado_rx; //Reinicio puntero
+						HAL_UART_Receive_IT(&huart6, (uint8_t*)crc_ptr_rx, 1);//Ponemos a escuchar CRC
+						state_rs485=RECIBIENDO_CRC;
+					}
+					break;
+
+		case RECIBIENDO_CRC:
+
+			contador_crc++;	//Contador de bytes de crc
+			if(contador_crc<=4)
+				{crc_ptr_rx++;		//Incremento el puntero antes de darselo a la api de receive (la api de receive ya fue llamada 1 vez en el otro estado)
+				HAL_UART_Receive_IT(&huart6, (uint8_t*)crc_ptr_rx, 1);}
+			else
+			{//El crc ha terminado. Podemos avisar al programa principal.
+				contador_crc=0;
+				crc_ptr_rx=crc_rx;	//Reinicio puntero
+				paquete_listo=true;//Aviso al programa principal para chequeo e impresion de trama.
+				state_rs485=RECIBIENDO_PAYLOAD;
+			}
+			break;
+			}
+		}
+
+
+}
+
+//Pasos para la recepcion:
+//1)Recibir todo
+//2)Chequear destino
+//3)Chequear CRC
+//4)Imprimir en pantalla
+//5)Mandar OK al emisor. Mandar NO OK unicamente si fallo el CRC.
 /* USER CODE END 4 */
 
 /**
