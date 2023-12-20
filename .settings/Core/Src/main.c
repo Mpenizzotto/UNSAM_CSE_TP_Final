@@ -36,6 +36,7 @@
 #define ORIGEN 2
 #define PACKET_DROP -1
 #define CRC_FAIL 1
+#define PACKET_OK	10
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,6 +47,7 @@
 /* Private variables ---------------------------------------------------------*/
 CRC_HandleTypeDef hcrc;
 
+UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart6;
 DMA_HandleTypeDef hdma_usart2_rx;
@@ -64,6 +66,8 @@ uint8_t* Payload;
 uint32_t CRC_calc=0;				//Pasarlo a vector, sino se calcula mal
 uint32_t tamanio_a_recibir=128;		//le damos el valor inicial máximo posible, y despues se ajusta al valor real cuando se sepa el size realmente.
 uint32_t contador_crc;
+uint8_t direccion_ack=0;
+uint8_t mensaje[5];
 bool paquete_listo=false;
 int a=0;
 
@@ -120,11 +124,12 @@ static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART6_UART_Init(void);
 static void MX_CRC_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 uint8_t convertir_ascii(uint8_t*vector_direccion);
 int8_t Receive_handler(void);
 void print(void);
-void send_ack(bool state);
+void send_ack(bool state, uint8_t direccion_ack);
 
 /* USER CODE END PFP */
 
@@ -168,6 +173,7 @@ int main(void)
   MX_USART2_UART_Init();
   MX_USART6_UART_Init();
   MX_CRC_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
    //Vector_tx[4]='\n';
   //Vector_tx[5]='\r';
@@ -233,9 +239,7 @@ int main(void)
 					Vector_recepcion_aux=Vector_recepcion;					//Volvemos a darle la dirección del vector original para la siguiente pasada
 
 					state=ENVIANDO_VECTOR;}	//Pasamos de estado de forma forzosa.
-
 		}
-
 		break;
 
 	case ENVIANDO_VECTOR:
@@ -292,7 +296,27 @@ int main(void)
 		//Me parece mejor hacerlo por interrupción y parsear en la callback.
 	}
 
-	Receive_handler();
+	switch(Receive_handler())
+	{
+	//enviando los acks de esta manera aseguramos que el programa pueda volver a pasar por "Receive Handler" otra vez.
+	//El flujo sería así:
+	//1)Envio mi mensaje original en "ENVIANDO_VECTOR".
+	//2)Al toque de enviarlo, saltan las interrupciones byte a byte. Queda en Encabezado_rx la info, y paquete_listo en true. Todo esto es al toque
+	//3)Se llega a receive handler, y este recibe e imprime (si corresponde), PERO NO MANDA ACK. Se limpia la estructura Encabezado_rx.
+	//4)Segun el valor de Receive_handler, se manda el ack, pero esto se hace despues. Al mandarlo, paquete_listo esta en false.
+	//5)Al enviar ack, se interrupme al toque y se llena Encabezado_rx. En la proxima pasada de loop, se imprime, porque se entra en receive_handler con paquete_listo=true. Luego se procederia a mandar ack de nuevo, y así.
+	case PACKET_OK:
+		send_ack(true, direccion_ack);
+		break;
+	case CRC_FAIL:
+		send_ack(false, direccion_ack);
+		break;
+	case PACKET_DROP:																			//la direccion destino no nos corresponde
+		HAL_UART_Transmit(&huart2, (unsigned char*)"\n\rPacket dropped",16 , HAL_MAX_DELAY);	//para debug
+		break;
+
+	default:{}
+	}
   }
   /* USER CODE END 2 */
 
@@ -378,6 +402,39 @@ static void MX_CRC_Init(void)
   /* USER CODE BEGIN CRC_Init 2 */
 
   /* USER CODE END CRC_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
 
 }
 
@@ -512,6 +569,7 @@ uint8_t convertir_ascii(uint8_t* vector_direccion)
 
 int8_t Receive_handler(void)
 {
+
 	if(paquete_listo==true)
 	{
 		if(Encabezado_rx.nodo_destino==ORIGEN)
@@ -519,40 +577,51 @@ int8_t Receive_handler(void)
 			HAL_CRC_Init(&hcrc);
 			if(HAL_CRC_Calculate(&hcrc, (uint32_t*)Encabezado_ptr_rx, (sizeof(Encabezado_rx) / 4))==*(uint32_t*)crc_rx) //ver esto. El micro es little endian, es posible que el CRC recibido se reciba al reves.
 			{
+				//1)primero se imprime (se usan valores de encabezado_rx)
 				print();
-				send_ack(true);
-				//Limpio estructura
+				//2)Limpio estructura: esto deberia hacerse antes de mandar el ack.
+				//El único valor que usa ACK de la trama anterior enviada es el origen de donde vino el msg
+				direccion_ack=Encabezado_rx.nodo_origen;
+				memcpy(mensaje, Encabezado_rx.payload, 5);
 				Encabezado_rx.nodo_origen=0;
 				Encabezado_rx.nodo_destino=0;
 				Encabezado_rx.size=0;
 				memset(Encabezado_rx.payload, 0, 125);
-				memset(Encabezado_rx.payload, 0, 125);
 				CRC_calc=0;
-				HAL_UART_Receive_IT(&huart6, (uint8_t*)Encabezado_ptr_rx, 1);//vuelvo a poner a escuchar. Esto quiza agrega 1 al puntero a chars (? Hay que rastrear ese incremento de ecabezado_ptr_rx
+				//Lo correcto sería poner este send_ack fuera del receive handler, y únicamente si salio en estado PACKET_OK.
+				//Así se podría volver a entrar al receive_handler por el ack, que sería lo correcto.
+				//4)Aviso que ya no hay paquete nuevo
+				paquete_listo=false;		//agregué esto también. Con esto debería andar.
+				//Acabo de enviar ack y me lo estoy recibiendo a mi mismo.
+				//Este Receive_IT se usaría para eso.
+				return (PACKET_OK);
 			}
 			else
 			{
-				send_ack(false);
-				//Limpio estructura
+				//1)Limpio estructura
+				direccion_ack=Encabezado_rx.nodo_origen;
+				memcpy(mensaje, Encabezado_rx.payload, 5 );
 				Encabezado_rx.nodo_origen=0;
 				Encabezado_rx.nodo_destino=0;
 				Encabezado_rx.size=0;
 				memset(Encabezado_rx.payload, 0, 125);
 				CRC_calc=0;
+				//3)Aviso que ya no hay paquete nuevo
 				paquete_listo=false;
-				HAL_UART_Receive_IT(&huart6, (uint8_t*)Encabezado_ptr_rx, 1);//vuelvo a poner a escuchar
 				return (CRC_FAIL);
 			}
 		}
 		else
 		{
+		//1) Limpio estructura
 		Encabezado_rx.nodo_origen=0;
 		Encabezado_rx.nodo_destino=0;
 		Encabezado_rx.size=0;
 		memset(Encabezado_rx.payload, 0, 125);
 		CRC_calc=0;
-		HAL_UART_Receive_IT(&huart6, (uint8_t*)Encabezado_ptr_rx, 1);//vuelvo a poner a escuchar
+		//2)Aviso que ya no hay paquete nuevo
 		paquete_listo=false;
+
 		return (PACKET_DROP);
 		}
 	}
@@ -565,11 +634,16 @@ void print(void)
 {
 	HAL_UART_Transmit(&huart2, (uint8_t*)&(Encabezado_rx.payload),Encabezado_rx.size , HAL_MAX_DELAY);
 }
-void send_ack(bool state)
+void send_ack(bool state, uint8_t direccion_ack)
 {
-
+	//El ACK se manda sólo si el mensaje previamente no fue un CRC de otra persona.
+	//No nos quedó guardado el contenido del mensaje, vamos a tener que guardarlo en variable.
+	if(strcmp(mensaje,(unsigned char*)"OK")==0 || strcmp(mensaje,(unsigned char*)"NO_OK")==0 )
+	{
+		return ;
+	}
 	Encabezado_tx_ack.nodo_origen=ORIGEN;
-	Encabezado_tx_ack.nodo_destino= Encabezado_rx.nodo_origen;	//Devuelvo ACK al origen del msg original
+	Encabezado_tx_ack.nodo_destino= direccion_ack;	//Devuelvo ACK al origen del msg original
 	Encabezado_tx_ack.size=(state==true)? (2) : (5);				//=size = (i%4>0) ? ((i/4)+1) : (i/4);
 	if(state==true)
 	memcpy(Encabezado_tx_ack.payload, (unsigned char*)"OK", 2 );	//memcpy requiere punteros en sus argumentos. No se puede hacer de otra forma. Tiene Destino, Origen, size de bytes. Todo punteros.
@@ -579,13 +653,16 @@ void send_ack(bool state)
 	HAL_CRC_Init(&hcrc);			//Para que estados pasados de CRC no afecten
 	CRC_calc=HAL_CRC_Calculate(&hcrc, (uint32_t*)Encabezado_ptr_tx_ack, (sizeof(Encabezado_tx_ack) / 4));
 	//Procedo a transmitir uno tras otro
+	//MX_USART6_UART_Init();
+
 	if(state)
-	HAL_UART_Transmit(&huart6, (uint8_t*)Encabezado_ptr_tx_ack,5, HAL_MAX_DELAY);	//La UART de recepcion se hace sobre la 6!!
+	HAL_UART_Transmit(&huart6, (uint8_t*)Encabezado_ptr_tx_ack, 5, HAL_MAX_DELAY);	//La UART de recepcion se hace sobre la 6!!
 	else
-	HAL_UART_Transmit(&huart6, (uint8_t*)Encabezado_ptr_tx_ack,8, HAL_MAX_DELAY);
+	HAL_UART_Transmit(&huart6, (uint8_t*)Encabezado_ptr_tx_ack, 8, HAL_MAX_DELAY);
 
 	HAL_UART_Transmit(&huart6, (uint8_t*) &CRC_calc, 4, HAL_MAX_DELAY);		//La de impresion por consola, por la 2 (la de la PC)
 
+	HAL_Delay(300);							//Delay porque si
 	//Limpiamos las estructuras antes de irnos
 	Encabezado_tx_ack.nodo_origen=0;
 	Encabezado_tx_ack.nodo_destino=0;
@@ -638,7 +715,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 				contador_crc=0;
 				crc_ptr_rx=crc_rx;	//Reinicio puntero
 				paquete_listo=true;//Aviso al programa principal para chequeo e impresion de trama.
-				//En la función Receive_handler() volvemos a poner a escuchar, acá no.
+				//Ponemos a escuchar nuevamente.
+				HAL_UART_Receive_IT(&huart6, (uint8_t*)Encabezado_ptr_rx, 1);
 				state_rs485=RECIBIENDO_PAYLOAD;
 			}
 			break;
